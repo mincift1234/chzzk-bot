@@ -9,14 +9,37 @@ import fs from 'fs';
 const buzzk = buzzkModule;
 const BuzzkChat = buzzk.chat;
 
-// Firebase Admin: 서비스 계정 JSON 사용
-const serviceAccount = JSON.parse(
-  fs.readFileSync('./serviceAccountKey.json', 'utf8')
-);
+// 1-1. Firebase Admin 초기화
+// Render 같은 서버에서는 환경변수(FIREBASE_PROJECT_ID, FIREBASE_CLIENT_EMAIL, FIREBASE_PRIVATE_KEY)를 쓰고,
+// 로컬 개발 환경에서는 serviceAccountKey.json 파일을 사용하는 방식으로 둘 다 지원.
+let firebaseApp;
 
-admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount)
-});
+if (
+  process.env.FIREBASE_PROJECT_ID &&
+  process.env.FIREBASE_CLIENT_EMAIL &&
+  process.env.FIREBASE_PRIVATE_KEY
+) {
+  // ENV 기반 초기화 (Render 등)
+  firebaseApp = admin.initializeApp({
+    credential: admin.credential.cert({
+      project_id: process.env.FIREBASE_PROJECT_ID,
+      client_email: process.env.FIREBASE_CLIENT_EMAIL,
+      // 환경변수에 들어간 \n 문자열을 실제 줄바꿈으로 변환
+      private_key: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n'),
+    }),
+  });
+  console.log('✅ Firebase initialized with ENV variables');
+} else {
+  // 로컬에서 serviceAccountKey.json 파일 사용하는 fallback
+  const serviceAccount = JSON.parse(
+    fs.readFileSync('./serviceAccountKey.json', 'utf8')
+  );
+
+  firebaseApp = admin.initializeApp({
+    credential: admin.credential.cert(serviceAccount),
+  });
+  console.log('✅ Firebase initialized with serviceAccountKey.json');
+}
 
 const db = admin.firestore();
 
@@ -28,7 +51,7 @@ const ownerUid = process.env.COMMAND_OWNER_UID;
 const refreshToken = process.env.REFRESH_TOKEN;
 
 if (!ownerUid) {
-  console.error('❌ COMMAND_OWNER_UID가 .env에 설정되어 있지 않습니다.');
+  console.error('❌ COMMAND_OWNER_UID가 .env 또는 환경변수에 설정되어 있지 않습니다.');
   process.exit(1);
 }
 
