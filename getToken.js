@@ -5,7 +5,7 @@ const CLIENT_ID = process.env.CLIENT_ID;
 const CLIENT_SECRET = process.env.CLIENT_SECRET;
 
 // 방금 새로 받은 code 값 붙여 넣기
-const CODE = "cKAAEKwZodfXsrQKnyJibjdRJCc";
+const CODE = "ghVMPkMGfamETlOOQYztmpwMHdI";
 const STATE = "abc123";
 const REDIRECT_URI = "http://localhost:8080/callback";
 

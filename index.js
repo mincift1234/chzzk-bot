@@ -1,129 +1,169 @@
-// index.js - 치지직 봇 메인 코드
+// index.js - 멀티 유저 치지직 봇 (미니 빵떡 V1)
 
 import 'dotenv/config';
 import buzzkModule from 'buzzk';
 import admin from 'firebase-admin';
-import fs from 'fs';
 
-// 1. buzzk / Firebase 준비
+// 1. buzzk 준비
 const buzzk = buzzkModule;
 const BuzzkChat = buzzk.chat;
 
-// 1-1. Firebase Admin 초기화
-// Render 같은 서버에서는 환경변수(FIREBASE_PROJECT_ID, FIREBASE_CLIENT_EMAIL, FIREBASE_PRIVATE_KEY)를 쓰고,
-// 로컬 개발 환경에서는 serviceAccountKey.json 파일을 사용하는 방식으로 둘 다 지원.
-let firebaseApp;
-
-if (
-  process.env.FIREBASE_PROJECT_ID &&
-  process.env.FIREBASE_CLIENT_EMAIL &&
-  process.env.FIREBASE_PRIVATE_KEY
-) {
-  // ENV 기반 초기화 (Render 등)
-  firebaseApp = admin.initializeApp({
-    credential: admin.credential.cert({
-      project_id: process.env.FIREBASE_PROJECT_ID,
-      client_email: process.env.FIREBASE_CLIENT_EMAIL,
-      // 환경변수에 들어간 \n 문자열을 실제 줄바꿈으로 변환
-      private_key: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n'),
-    }),
-  });
-  console.log('✅ Firebase initialized with ENV variables');
-} else {
-  // 로컬에서 serviceAccountKey.json 파일 사용하는 fallback
-  const serviceAccount = JSON.parse(
-    fs.readFileSync('./serviceAccountKey.json', 'utf8')
-  );
-
-  firebaseApp = admin.initializeApp({
-    credential: admin.credential.cert(serviceAccount),
-  });
-  console.log('✅ Firebase initialized with serviceAccountKey.json');
-}
+// 2. Firebase Admin 초기화 (ENV 방식)
+admin.initializeApp({
+  credential: admin.credential.cert({
+    project_id: process.env.FIREBASE_PROJECT_ID,
+    client_email: process.env.FIREBASE_CLIENT_EMAIL,
+    private_key: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n'),
+  }),
+});
 
 const db = admin.firestore();
 
-// 2. CHZZK 클라이언트 인증 (CLIENT_ID / SECRET)
+// 3. CHZZK 클라이언트 인증
 buzzk.auth(process.env.CLIENT_ID, process.env.CLIENT_SECRET);
 
-// 3. 내 uid (commands/{uid}에서 명령어 읽음)
-const ownerUid = process.env.COMMAND_OWNER_UID;
-const refreshToken = process.env.REFRESH_TOKEN;
+// 🔹 여러 유저에 대한 봇 인스턴스를 관리하는 맵
+// uid -> { chat, commands }
+const bots = new Map();
 
-if (!ownerUid) {
-  console.error('❌ COMMAND_OWNER_UID가 .env 또는 환경변수에 설정되어 있지 않습니다.');
-  process.exit(1);
+// 유저 1명에 대한 명령어 로드
+async function loadCommandsForUser(uid) {
+  const docRef = db.collection('commands').doc(uid);
+  const snap = await docRef.get();
+  const data = snap.data() || {};
+  const commands = data.commands || {};
+  return commands;
 }
 
-let commandMap = {}; // 메모리에 캐시해둘 명령어들
+// 유저 1명에 대한 봇 생성 & 연결
+async function startBotForUser(userDoc) {
+  const uid = userDoc.id;
+  const data = userDoc.data();
 
-// Firestore에서 명령어 로드
-async function loadCommands() {
-  try {
-    const docRef = db.collection('commands').doc(ownerUid);
-    const snap = await docRef.get();
-    const data = snap.data() || {};
-    commandMap = data.commands || {};
-    console.log('🔁 명령어 로드 완료:', commandMap);
-  } catch (err) {
-    console.error('❌ 명령어 로드 오류:', err);
+  const refreshToken = data.chzzkRefreshToken;
+  const botEnabled = data.botEnabled;
+
+  if (!botEnabled) {
+    console.log(`⏸ [${uid}] botEnabled=false, 스킵`);
+    return;
   }
-}
 
-async function startBot() {
+  if (!refreshToken) {
+    console.log(`⚠️ [${uid}] chzzkRefreshToken 없음, 스킵`);
+    return;
+  }
+
   try {
-    // 1) 명령어 먼저 한 번 로드
-    await loadCommands();
-
-    // 2) 30초마다 명령어 다시 로드 (관리자 사이트에서 수정해도 반영되게)
-    setInterval(loadCommands, 30000);
-
-    // 3) refreshToken으로 accessToken 발급
+    console.log(`🔑 [${uid}] refreshToken으로 accessToken 발급 시도`);
     const oauth = await buzzk.oauth.refresh(refreshToken);
+
     if (!oauth || !oauth.access) {
-      console.error('❌ refreshToken으로 accessToken 발급 실패:', oauth);
+      console.error(`❌ [${uid}] accessToken 발급 실패:`, oauth);
       return;
     }
 
     const accessToken = oauth.access;
 
-    // 4) 채팅 연결
+    // 이미 돌아가는 봇이 있으면 먼저 정리
+    if (bots.has(uid)) {
+      try {
+        const old = bots.get(uid);
+        if (old.chat) {
+          old.chat.disconnect?.();
+        }
+      } catch (e) {
+        console.error(`⚠️ [${uid}] 기존 봇 정리 중 에러:`, e);
+      }
+      bots.delete(uid);
+    }
+
     const chat = new BuzzkChat(accessToken);
     await chat.connect();
 
-    console.log('✅ 치지직 봇 채팅 연결 완료');
+    console.log(`✅ [${uid}] 치지직 봇 채팅 연결 완료`);
 
-    // 5) 채팅 이벤트 처리
-    chat.onMessage(async (data) => {
-      const msg = (data.message || '').trim();
-      const nick = data.author?.name || '알수없음';
+    // 명령어 로드
+    let commands = await loadCommandsForUser(uid);
+    console.log(`🔁 [${uid}] 명령어 로드:`, commands);
 
-      console.log(`${nick}: ${msg}`);
+    // bots 맵에 저장
+    bots.set(uid, { chat, commands });
 
-      // 5-1) Firestore에서 가져온 명령어 exact match
-      if (commandMap[msg]) {
-        await chat.send(commandMap[msg]);
+    // 30초마다 이 유저 명령어 갱신
+    setInterval(async () => {
+      try {
+        const updated = await loadCommandsForUser(uid);
+        const info = bots.get(uid);
+        if (info) {
+          info.commands = updated;
+          console.log(`🔁 [${uid}] 명령어 갱신:`, updated);
+        }
+      } catch (err) {
+        console.error(`❌ [${uid}] 명령어 갱신 중 에러:`, err);
+      }
+    }, 30000);
+
+    // 채팅 처리
+    chat.onMessage(async (msgData) => {
+      const msg = (msgData.message || '').trim();
+      const nick = msgData.author?.name || '알수없음';
+
+      const info = bots.get(uid);
+      const cmdMap = info?.commands || {};
+
+      console.log(`[${uid}] ${nick}: ${msg}`);
+
+      // 유저별 커맨드 매칭
+      if (cmdMap[msg]) {
+        await chat.send(cmdMap[msg]);
         return;
       }
 
-      // 5-2) 예시: !픽 제트 → 파라미터 있는 커맨드
+      // 예: 공통 샘플 커맨드
       if (msg.startsWith('!픽 ')) {
         const agent = msg.split(' ')[1] || '레이나';
         await chat.send(`${nick}님, 오늘 픽은 ${agent} 추천!`);
       }
     });
 
-    // 6) 끊어지면 재연결
     chat.onDisconnect(() => {
-      console.log('⚠️ 채팅 연결 끊김, 5초 후 재연결 시도');
-      setTimeout(startBot, 5000);
+      console.log(`⚠️ [${uid}] 채팅 연결 끊김, 5초 후 재연결 시도`);
+      setTimeout(() => startBotForUser(userDoc), 5000);
     });
   } catch (err) {
-    console.error('❌ 봇 시작 중 에러:', err);
-    console.log('5초 후 재시도');
-    setTimeout(startBot, 5000);
+    console.error(`❌ [${uid}] 봇 시작 중 에러:`, err);
   }
 }
 
-// 7. 봇 실행
-startBot();
+// 전체 유저에 대해 봇 시작 / 재시작
+async function startAllBots() {
+  console.log('🌐 전체 유저 봇 시작/갱신');
+
+  const snap = await db
+    .collection('users')
+    .where('botEnabled', '==', true)
+    .get();
+
+  if (snap.empty) {
+    console.log('ℹ️ botEnabled=true 유저가 없음');
+    return;
+  }
+
+  for (const userDoc of snap.docs) {
+    await startBotForUser(userDoc);
+  }
+}
+
+async function main() {
+  try {
+    await startAllBots();
+
+    // 1분마다 botEnabled=true 유저 목록을 다시 보고
+    // 새로 켜진 유저가 있으면 봇 추가
+    setInterval(startAllBots, 60000);
+  } catch (err) {
+    console.error('❌ 메인 루프 에러:', err);
+  }
+}
+
+main();
